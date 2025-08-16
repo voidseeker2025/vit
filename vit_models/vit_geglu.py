@@ -9,12 +9,13 @@ from einops.layers.torch import Rearrange
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import os
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler  
 import csv
 import time
 from datetime import datetime
 
-# --- Device ---
+
+# Check device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- Helper ---
@@ -22,20 +23,24 @@ def pair(t):
     return t if isinstance(t, tuple) else (t, t)
 
 # --- ViT Components ---
-class FeedForward(nn.Module):
+class FeedForwardGEGLU(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout)
-        )
-
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, hidden_dim * 2)  # for gate + value
+        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.dropout = nn.Dropout(dropout)
+    
     def forward(self, x):
-        return self.net(x)
+        x = self.norm(x)
+        x_proj = self.fc1(x)
+        x_gate, x_val = x_proj.chunk(2, dim=-1)
+        x = torch.nn.functional.gelu(x_gate) * x_val  # GELU activation
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.dropout(x)
+        return x
+
 
 class Attention(nn.Module):
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.):
@@ -88,26 +93,23 @@ class Transformer(nn.Module):
 
 class ViT(nn.Module):
     def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim,
-                 pool='cls', channels=3, dim_head=64, dropout=0., emb_dropout=0.,
-                 stride=None, padding=None):
+                 pool='cls', channels=3, dim_head=64, dropout=0., emb_dropout=0.):
         super().__init__()
         image_height, image_width = pair(image_size)
         patch_height, patch_width = pair(patch_size)
 
-        if stride is None:
-            stride = patch_size
-        if padding is None:
-            padding = 0
-        # change to convolutional patch embedding
+        assert image_height % patch_height == 0 and image_width % patch_width == 0
+
+        num_patches = (image_height // patch_height) * (image_width // patch_width)
+        patch_dim = channels * patch_height * patch_width
+        assert pool in {'cls', 'mean'}
+
         self.to_patch_embedding = nn.Sequential(
-            nn.Conv2d(in_channels=channels, out_channels=dim,
-                      kernel_size=patch_size, stride=stride, padding=padding),
-            Rearrange('b d h w -> b (h w) d'),
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_height, p2=patch_width),
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, dim),
             nn.LayerNorm(dim),
         )
-
-        num_patches = ((image_height + 2 * padding - patch_height) // stride + 1) * \
-                      ((image_width + 2 * padding - patch_width) // stride + 1)
 
         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
@@ -117,6 +119,7 @@ class ViT(nn.Module):
 
         self.pool = pool
         self.to_latent = nn.Identity()
+
         self.mlp_head = nn.Linear(dim, num_classes)
 
     def forward(self, img):
@@ -130,6 +133,7 @@ class ViT(nn.Module):
 
         x = self.transformer(x)
         x = x.mean(dim=1) if self.pool == 'mean' else x[:, 0]
+
         x = self.to_latent(x)
         return self.mlp_head(x)
 
@@ -146,12 +150,11 @@ test_dataset = datasets.CIFAR10(root='./data', train=False, download=True, trans
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=64)
 
+
 # --- Model ---
 model = ViT(
     image_size=32,
     patch_size=4,
-    stride=4,
-    padding=2,
     num_classes=10,
     dim=256,
     depth=12,
@@ -163,23 +166,26 @@ model = ViT(
 
 # --- Optimizer, Scaler, Loss ---
 optimizer = optim.Adam(model.parameters(), lr=3e-4)
-scaler = GradScaler()
-epochs = 20 # best at 14 
+scaler = GradScaler()  # Mixed precision
+epochs = 20 # best model around  ep12
 
-train_losses, test_losses, train_accs, test_accs, epoch_times = [], [], [], [], []
+train_losses, test_losses, train_accs, test_accs = [], [], [], []
 
 # --- Training Loop ---
+epoch_times = []
+
 for epoch in range(epochs):
+    start_time = time.time()
+
     model.train()
     train_loss, correct, total = 0, 0, 0
-    start_time = time.time()
 
     loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
     for images, labels in loop:
         images, labels = images.to(device), labels.to(device)
 
         optimizer.zero_grad()
-        with autocast():
+        with autocast(): 
             outputs = model(images)
             loss = F.cross_entropy(outputs, labels)
 
@@ -202,7 +208,7 @@ for epoch in range(epochs):
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
-            with autocast():
+            with autocast(): 
                 outputs = model(images)
                 loss = F.cross_entropy(outputs, labels)
             test_loss += loss.item()
@@ -212,11 +218,11 @@ for epoch in range(epochs):
     test_acc = correct / total
     test_losses.append(test_loss / len(test_loader))
     test_accs.append(test_acc)
-
-    epoch_duration = time.time() - start_time
+    end_time = time.time()
+    epoch_duration = end_time - start_time
     epoch_times.append(epoch_duration)
 
-    print(f"Epoch {epoch+1} | Train Acc: {train_acc:.4f} | Test Acc: {test_acc:.4f} | Time: {epoch_duration:.2f}s")
+    print(f"Epoch {epoch+1} | Train Acc: {train_acc:.4f} | Test Acc: {test_acc:.4f}")
 
 # --- Plot Results ---
 plt.figure(figsize=(12, 4))
@@ -238,8 +244,7 @@ plt.show()
 # --- Save Training Data to CSV ---
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 folder_path = os.path.join("vit", "vit_result")
-csv_filename = os.path.join(folder_path, "vit_overlap.csv")
-
+csv_filename = os.path.join(folder_path, "vit_geglu.csv")
 total_time = sum(epoch_times)
 
 with open(csv_filename, mode='w', newline='') as file:

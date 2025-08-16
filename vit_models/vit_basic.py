@@ -152,8 +152,8 @@ model = ViT(
     patch_size=4,
     num_classes=10,
     dim=256,
-    depth=6,
-    heads=8,
+    depth=12,
+    heads=3,
     mlp_dim=512,
     dropout=0.1,
     emb_dropout=0.1
@@ -239,7 +239,7 @@ plt.show()
 # --- Save Training Data to CSV ---
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 folder_path = os.path.join("vit", "vit_result")
-csv_filename = os.path.join(folder_path, "vit_overlap.csv")
+csv_filename = os.path.join(folder_path, "vit_basic.csv")
 total_time = sum(epoch_times)
 
 with open(csv_filename, mode='w', newline='') as file:
@@ -262,4 +262,4 @@ with open(csv_filename, mode='w', newline='') as file:
 
 
 print(f"\nTraining log saved to {csv_filename}")
-print(f"\nTotal Training Time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+
